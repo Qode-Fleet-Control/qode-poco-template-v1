@@ -1,130 +1,72 @@
-# fleet-template-v1
+# POCO template
 
-## What This Template Is
+Provisioned from [`Qode-Fleet-Control/fleet-template-v1`](https://github.com/Qode-Fleet-Control/fleet-template-v1) — the fleet
+lifecycle contract (`bin/`, `fleet.conf`, `compose.yaml`, deploy workflows) with a POCO (Poco::Net HTTPServer) starter laid on top.
 
-`fleet-template-v1` is a **language-agnostic app lifecycle harness** for apps
-managed by the fleet platform. It gives any app — Node, Python, Go, a Docker
-Compose stack, anything — a uniform way to be deployed and controlled, without
-the fleet needing to know a single thing about your stack.
+A small HTTP service on the POCO C++ Libraries 1.13 (Debian trixie), built with CMake: a `Poco::Util::ServerApplication` that owns a `Poco::Net::HTTPServer`, with one `HTTPRequestHandler` per route. Routes: `GET /` (plain-text greeting), `GET /health` (`{"status":"ok"}`), `GET /api/time` (`{"time":"<ISO-8601>"}`); anything else is a JSON 404.
 
-The fleet injects runtime variables into the environment (`PORT`, `BASE_PATH`,
-`DATABASE_URL`) and calls `./bin/run` to deploy. Everything project-specific —
-how to install, build, and start your app — lives in **one file: `fleet.conf`**.
-That is the only file you edit per project.
+## Origin
 
-## Repository Structure
+    hand-written (POCO ships no project generator) — src/main.cpp follows POCO's own Net sample HTTPTimeServer (ServerApplication + HTTPServer + HTTPRequestHandlerFactory, waitForTerminationRequest()); CMakeLists.txt uses POCO's CMake package: find_package(Poco REQUIRED COMPONENTS ...) + Poco::<component> targets
 
-```
-fleet.conf        ← the only file you edit per project
-.env              ← local-only env vars (gitignored)
-bin/
-  _common.sh      ← shared logic; never edit this
-  run             ← install + build + start (called by the fleet)
-  start           ← start only (no rebuild)
-  restart         ← stop + full run
-  reload          ← hot-reload config without rebuild
-  stop            ← stop the running process
-```
 
-## The One File You Edit: `fleet.conf`
+## Run it
 
-`fleet.conf` is sourced as shell by the lifecycle scripts. Fill in the commands
-for your stack; leave any command empty (`''`) to skip that step.
+### On the fleet
+
+The fleet runs it as containers (the docker runtime): `bin/run` builds the image with
+`docker compose build` and then starts it with `docker compose up` in the foreground, publishing `$PORT`.
+
+It listens on `0.0.0.0:$PORT` (default `8080`), read from the environment when the container starts,
+and serves at the root of its own hostname (`https://<hash>.<FLEET_APP_DOMAIN>/`). The health check hits `/health`.
+
+### With docker
 
 ```sh
-NAME="my-app"           # label shown in fleet logs
-PORT="3000"             # default port (fleet overrides via $PORT env var)
-HEALTH_PATH="/"         # HTTP path that returns 200 when the app is ready
-
-INSTALL_CMD='npm ci'
-BUILD_CMD='npm run build'
-START_CMD='node dist/server.js'   # must listen on $PORT; run in foreground
-RELOAD_CMD=''           # optional; empty → falls back to stop+start
+PORT=8080 bin/run                 # build + run through compose, Ctrl-C to stop
+docker compose up --build             # the same, by hand
+curl localhost:8080/health
+curl localhost:8080/api/time
 ```
 
-> **Critical rule:** single-quote any command that uses `$PORT` or
-> `$BASE_PATH`. Single quotes defer variable expansion to **runtime** — when the
-> command actually runs, with the fleet-injected value — rather than at the
-> moment `fleet.conf` is sourced (when those values aren't set yet). Use
-> `START_CMD='gunicorn app:app --bind 0.0.0.0:$PORT'`, never double quotes.
-
-## How the Lifecycle Works
-
-| Script | What it does | When to use |
-| --- | --- | --- |
-| `bin/run` | `INSTALL_CMD` → `BUILD_CMD` → `START_CMD` | Fleet deploy, fresh start |
-| `bin/start` | `START_CMD` only | Restart without rebuild |
-| `bin/restart` | stop + `bin/run` | After a code/dep change |
-| `bin/reload` | `RELOAD_CMD`, or stop+start if empty | After a config-only change |
-| `bin/stop` | Kill by pidfile or port | Tear down |
-
-> The process PID is written to `.fleet/app.pid` so subsequent `stop`/`restart`
-> calls can find and terminate it reliably. If the pidfile is missing or stale,
-> `stop` falls back to freeing whatever is listening on `$PORT`.
-
-## How to Apply This to Your Project
-
-### Step 1 — Copy the template into your repo
+### Without docker
 
 ```sh
-cp -r fleet-template-v1/* my-project/
+# Debian/Ubuntu: sudo apt install build-essential cmake libpoco-dev
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
+PORT=8080 ./build/app
+# or: FLEET_RUNTIME=process PORT=8080 bin/run
 ```
 
-Or, if starting fresh, just clone it and work from `main`.
+`fleet.conf` drives every script in `bin/`:
 
-### Step 2 — Edit `fleet.conf` (the only required change)
+| step | docker runtime (fleet) | `FLEET_RUNTIME=process` |
+|---|---|---|
+| install | — | `(none)` |
+| build | `docker compose build` | `cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j` |
+| start | `docker compose up --remove-orphans` | `env PORT="$PORT" ./build/app` |
 
-Fill in your stack's commands. Per-stack examples:
+## Layout
 
-```sh
-# Node.js
-INSTALL_CMD='npm ci'
-BUILD_CMD='npm run build'
-START_CMD='node dist/index.js'
+- `CMakeLists.txt` — one executable target `app`, linked to `Poco::Foundation`, `Poco::Net`, `Poco::Util`, `Poco::JSON`.
+- `src/main.cpp` — the handlers, the factory that routes by path, and the `ServerApplication`.
+- `Dockerfile` — `debian:trixie` build stage with `libpoco-dev`; `debian:trixie-slim` runtime with only `libpocofoundation100`, `libpoconet100`, `libpocoutil100`, `libpocojson100`; non-root user `app`.
+- `compose.yaml` — service `app`, publishes `${PORT:-8080}:${PORT:-8080}`, fleet variables passed through by name.
 
-# Python (Gunicorn)
-INSTALL_CMD='pip install -r requirements.txt'
-BUILD_CMD=''
-START_CMD='gunicorn app:app --bind 0.0.0.0:$PORT'
+## Deviations from stock, and why
 
-# Go
-INSTALL_CMD=''
-BUILD_CMD='go build -o ./out/server ./cmd/server'
-START_CMD='./out/server'
+- HTTPTimeServer reads its port from a properties file (`HTTPTimeServer.port`, default 9980) and serves one HTML page; this reads `$PORT` from the environment at runtime (default 8080), binds `0.0.0.0`, and routes several paths, JSON via `Poco::JSON`.
+- Added a `/health` route for the fleet's health check.
+- No `.properties` config file and no command-line option handling (`defineOptions`/`handleOption`), to keep the starter small.
 
-# Docker Compose
-INSTALL_CMD=''
-BUILD_CMD='docker compose build'
-START_CMD='docker compose up'
-RELOAD_CMD='docker compose up -d --no-build'
-```
+## Verified
 
-### Step 3 — Set local env vars in `.env` (gitignored)
+2026-10-05, Docker 29.8 on linux/amd64:
 
-```sh
-APP_NAME=My App
-DATABASE_URL=postgres://localhost/mydb
-```
+- `verify.sh <dir> 46508` (the migrate-docker-runtime skill's end-to-end check) → `run=200 restart=200 containers_after_stop=0`.
+- `migrate.py audit <dir>` → `READY`.
+- `docker compose up` with `PORT=46508`: `GET /` → 200 `Hello from the POCO template!`, `GET /health` → `{"status":"ok"}`. (`/api/time` was not exercised.)
 
-### Step 4 — Verify standalone
+The no-docker path (`FLEET_RUNTIME=process`) was not run on a host toolchain; it is the same CMake build the image runs.
 
-```sh
-PORT=3001 bin/run      # should install, build, and serve on 3001
-curl http://localhost:3001/   # should 200
-```
-
-### Step 5 — Connect to the fleet
-
-Point the fleet at your repo. It will clone it, inject `PORT` / `BASE_PATH` /
-`DATABASE_URL`, and call `bin/run`. As long as your `START_CMD` listens on
-`$PORT` and `HEALTH_PATH` returns 200, the fleet will mark the app healthy.
-
-## Key Invariants
-
-- **`START_CMD` must run in the foreground and listen on `$PORT`.** Do not use a
-  dev server — HMR / hot-reload chunks 404 behind the ingress and will break the
-  app.
-- **Never put secrets in `fleet.conf`** — it's committed. Use `.env` locally;
-  the fleet injects secrets via the environment.
-- **`bin/_common.sh` is shared infrastructure** — don't edit it per project. All
-  project-specific configuration belongs in `fleet.conf`.
+See `docs/fleet-lifecycle.md` for the lifecycle contract.
