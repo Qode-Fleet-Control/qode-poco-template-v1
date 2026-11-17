@@ -26,7 +26,11 @@
 #include <Poco/URI.h>
 #include <Poco/Util/ServerApplication.h>
 
+#include <chrono>
+#include <cstdio>
 #include <iostream>
+#include <memory>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -85,9 +89,56 @@ public:
     }
 };
 
+// KEEP THIS: one log line per request (status + duration) is what the workspace Monitoring tab charts.
+// Wraps every route's handler and, once it has answered, writes one JSON line to stdout, e.g.
+//   {"durationMs":0.123,"method":"GET","path":"/health","status":200,"ua":"curl/8.5.0"}
+// Never the query string, headers other than the user agent, or bodies.
+class RequestLogHandler : public HTTPRequestHandler {
+public:
+    explicit RequestLogHandler(HTTPRequestHandler* inner) : inner_(inner) {}
+
+    void handleRequest(HTTPServerRequest& request, HTTPServerResponse& response) override
+    {
+        const auto start = std::chrono::steady_clock::now();
+        try {
+            inner_->handleRequest(request, response);
+        } catch (...) {
+            log(request, response.sent() ? response.getStatus() : HTTPResponse::HTTP_INTERNAL_SERVER_ERROR, start);
+            throw;
+        }
+        log(request, response.getStatus(), start);
+    }
+
+private:
+    static void log(const HTTPServerRequest& request, int status, std::chrono::steady_clock::time_point start)
+    {
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        Poco::JSON::Object line;
+        line.set("status", status);
+        line.set("durationMs", static_cast<double>(static_cast<long long>(ms * 1000.0 + 0.5)) / 1000.0);
+        line.set("method", request.getMethod());
+        line.set("path", Poco::URI(request.getURI()).getPath());
+        line.set("ua", request.get("User-Agent", ""));
+        std::ostringstream out;
+        line.stringify(out);
+        out << '\n';
+        const std::string s = out.str();
+        std::fwrite(s.data(), 1, s.size(), stdout);  // one write per line: no interleaving across threads
+        std::fflush(stdout);
+    }
+
+    std::unique_ptr<HTTPRequestHandler> inner_;
+};
+
 class RequestHandlerFactory : public HTTPRequestHandlerFactory {
 public:
     HTTPRequestHandler* createRequestHandler(const HTTPServerRequest& request) override
+    {
+        return new RequestLogHandler(route(request));
+    }
+
+private:
+    static HTTPRequestHandler* route(const HTTPServerRequest& request)
     {
         const std::string path = Poco::URI(request.getURI()).getPath();
         if (path == "/")
